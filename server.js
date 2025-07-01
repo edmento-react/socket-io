@@ -118,6 +118,23 @@ app.get('/health', (req, res) => {
   });
 });
 
+// POST API: Accept a message and broadcast to TV if connected
+app.post('/api/message', (req, res) => {
+  const { message } = req.body;
+  if (!message) {
+    return res.status(400).json({ status: 'error', error: 'Message is required' });
+  }
+  logConnection(`Received POST message: ${message}`);
+  // Broadcast to TV if connected
+  if (clients.tv) {
+    clients.tv.emit('message_from_api', {
+      message,
+      timestamp: new Date().toISOString()
+    });
+  }
+  res.json({ status: 'sent', message });
+});
+
 // Socket.IO connection handling
 io.on('connection', (socket) => {
   stats.totalConnections++;
