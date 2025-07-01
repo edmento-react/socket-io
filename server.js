@@ -171,7 +171,7 @@ io.on('connection', (socket) => {
         // Notify TV about mobile connection
         if (clients.tv) {
           clients.tv.emit('mobile_connected', { 
-            status: 'connected',
+            status: 'mobile_connected',
             clientId: socket.id,
             timestamp: new Date().toISOString()
           });
@@ -192,7 +192,7 @@ io.on('connection', (socket) => {
         // Notify mobile about TV connection
         if (clients.mobile) {
           clients.mobile.emit('tv_connected', { 
-            status: 'connected',
+            status: 'tv_connected',
             clientId: socket.id,
             timestamp: new Date().toISOString()
           });
