@@ -12,8 +12,14 @@ const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
     origin: process.env.CORS_ORIGIN || "*",
-    methods: ["GET", "POST"]
-  }
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["*"],
+    credentials: true
+  },
+  allowEIO3: true,
+  transports: ['websocket', 'polling'],
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 // Store rooms with their connected clients
@@ -35,28 +41,48 @@ const stats = {
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.'
+  max: 1000, // Increased limit for development
+  message: { error: 'Too many requests from this IP, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false
 });
 
 // Middleware
-app.use(helmet());
-app.use(cors());
-app.use(express.json());
+app.use(helmet({
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["*"],
+  credentials: true
+}));
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(limiter);
 
 // Utility functions
 const logConnection = (message) => {
-  console.log(`[${new Date().toISOString()}] ${message}`);
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${message}`);
 };
 
 const generateRoomId = () => {
-  // Generate a 6-character room ID
-  return crypto.randomBytes(3).toString('hex').toUpperCase();
+  // Generate a 6-character room ID (alphanumeric, avoiding confusing characters)
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let result = '';
+  for (let i = 0; i < 6; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
 };
 
-const validateDeviceType = (deviceType) => {
-  return ['mobile', 'tv'].includes(deviceType);
+const validateRoomId = (roomId) => {
+  return roomId && typeof roomId === 'string' && roomId.length >= 4;
 };
 
 const getRoomInfo = (roomId) => {
@@ -69,7 +95,9 @@ const getRoomInfo = (roomId) => {
     hasMobile: !!room.mobile,
     createdAt: room.createdAt,
     tvId: room.tv?.id,
-    mobileId: room.mobile?.id
+    mobileId: room.mobile?.id,
+    tvConnected: room.tv?.connected || false,
+    mobileConnected: room.mobile?.connected || false
   };
 };
 
@@ -77,34 +105,61 @@ const getConnectionStatus = () => {
   const roomsArray = Array.from(rooms.values());
   return {
     totalRooms: rooms.size,
-    connectedTVs: roomsArray.filter(room => room.tv).length,
-    connectedMobiles: roomsArray.filter(room => room.mobile).length,
-    fullyConnectedRooms: roomsArray.filter(room => room.tv && room.mobile).length
+    connectedTVs: roomsArray.filter(room => room.tv && room.tv.connected).length,
+    connectedMobiles: roomsArray.filter(room => room.mobile && room.mobile.connected).length,
+    fullyConnectedRooms: roomsArray.filter(room => room.tv && room.mobile && room.tv.connected && room.mobile.connected).length
   };
 };
 
-const cleanupRoom = (roomId) => {
+const cleanupRoom = (roomId, reason = 'cleanup') => {
   const room = rooms.get(roomId);
   if (room) {
-    if (room.tv) room.tv.leave(roomId);
-    if (room.mobile) room.mobile.leave(roomId);
+    logConnection(`Cleaning up room ${roomId} - Reason: ${reason}`);
+    
+    if (room.tv && room.tv.connected) {
+      room.tv.leave(roomId);
+      room.tv.emit('room_cleanup', { reason });
+    }
+    if (room.mobile && room.mobile.connected) {
+      room.mobile.leave(roomId);
+      room.mobile.emit('room_cleanup', { reason });
+    }
+    
     rooms.delete(roomId);
     stats.activeRooms = rooms.size;
-    logConnection(`Room ${roomId} cleaned up`);
+    logConnection(`Room ${roomId} cleaned up successfully`);
+  }
+};
+
+const notifyRoomDevices = (roomId, eventName, data, excludeSocket = null) => {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  
+  const timestamp = new Date().toISOString();
+  const eventData = { ...data, timestamp, roomId };
+  
+  if (room.tv && room.tv.connected && room.tv !== excludeSocket) {
+    room.tv.emit(eventName, eventData);
+  }
+  if (room.mobile && room.mobile.connected && room.mobile !== excludeSocket) {
+    room.mobile.emit(eventName, eventData);
   }
 };
 
 // Routes
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'Multi-Room Socket.IO Presentation Server Running',
-    version: '2.0.0',
+    status: 'Flutter Socket.IO Presentation Server Running',
+    version: '2.2.0',
     uptime: Math.floor((Date.now() - stats.startTime.getTime()) / 1000),
     stats: {
       currentConnections: stats.currentConnections,
       totalConnections: stats.totalConnections,
-      activeRooms: rooms.size
-    }
+      activeRooms: rooms.size,
+      mobileConnections: stats.mobileConnections,
+      tvConnections: stats.tvConnections
+    },
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -112,6 +167,7 @@ app.get('/api/status', (req, res) => {
   res.json({
     server: {
       status: 'running',
+      version: '2.2.0',
       uptime: Math.floor((Date.now() - stats.startTime.getTime()) / 1000),
       startTime: stats.startTime.toISOString()
     },
@@ -147,39 +203,39 @@ app.get('/api/rooms/:roomId', (req, res) => {
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'healthy',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor((Date.now() - stats.startTime.getTime()) / 1000),
+    connections: stats.currentConnections
   });
 });
 
-// POST API: Send message to specific room
-app.post('/api/message', (req, res) => {
-  const { message, roomId } = req.body;
+// API endpoint to send messages to specific rooms
+app.post('/api/rooms/:roomId/message', (req, res) => {
+  const { roomId } = req.params;
+  const { message, target = 'tv' } = req.body;
   
   if (!message) {
-    return res.status(400).json({ status: 'error', error: 'Message is required' });
+    return res.status(400).json({ error: 'Message is required' });
   }
-  
-  if (!roomId) {
-    return res.status(400).json({ status: 'error', error: 'Room ID is required' });
-  }
-  
-  logConnection(`Received POST message for room ${roomId}: ${message}`);
   
   const room = rooms.get(roomId);
   if (!room) {
-    return res.status(404).json({ status: 'error', error: 'Room not found' });
+    return res.status(404).json({ error: 'Room not found' });
   }
   
-  // Broadcast to TV in the specific room
-  if (room.tv) {
-    room.tv.emit('message_from_api', {
-      message,
-      timestamp: new Date().toISOString()
-    });
-    res.json({ status: 'sent', message, roomId });
-  } else {
-    res.status(404).json({ status: 'error', error: 'No TV connected in this room' });
+  const targetDevice = target === 'mobile' ? room.mobile : room.tv;
+  if (!targetDevice || !targetDevice.connected) {
+    return res.status(404).json({ error: `${target} not connected in this room` });
   }
+  
+  targetDevice.emit('api_message', {
+    message,
+    timestamp: new Date().toISOString(),
+    from: 'api'
+  });
+  
+  logConnection(`API message sent to ${target} in room ${roomId}: ${message}`);
+  res.json({ status: 'sent', message, target, roomId });
 });
 
 // Socket.IO connection handling
@@ -187,21 +243,39 @@ io.on('connection', (socket) => {
   stats.totalConnections++;
   stats.currentConnections++;
   socket.connectedAt = new Date().toISOString();
+  socket.isHealthy = true;
   
-  logConnection(`Client connected: ${socket.id}`);
+  logConnection(`Client connected: ${socket.id} from ${socket.handshake.address} using ${socket.conn.transport.name}`);
 
   // Handle TV registration (creates a new room)
   socket.on('register_tv', (data) => {
     try {
-      const roomId = data.roomId || generateRoomId();
+      logConnection(`TV registration request: ${JSON.stringify(data)} from ${socket.id}`);
+      
+      // Convert numeric room ID to string if needed, or generate new one
+      let roomId = data?.roomId ? data.roomId.toString() : generateRoomId();
+      
+      // Validate room ID
+      if (!validateRoomId(roomId)) {
+        roomId = generateRoomId();
+        logConnection(`Invalid room ID provided, generated new one: ${roomId}`);
+      }
       
       // Check if room already has a TV
-      if (rooms.has(roomId) && rooms.get(roomId).tv) {
-        socket.emit('error', { 
-          message: 'Room already has a TV connected',
-          code: 'ROOM_TV_EXISTS'
-        });
-        return;
+      if (rooms.has(roomId) && rooms.get(roomId).tv?.connected) {
+        logConnection(`Room ${roomId} already has a connected TV, replacing...`);
+        const existingRoom = rooms.get(roomId);
+        if (existingRoom.tv && existingRoom.tv.id !== socket.id) {
+          existingRoom.tv.emit('replaced', { 
+            message: 'New TV connected to this room',
+            timestamp: new Date().toISOString()
+          });
+          existingRoom.tv.leave(roomId);
+          if (existingRoom.tv.connected) {
+            existingRoom.tv.disconnect(true);
+          }
+          stats.tvConnections = Math.max(0, stats.tvConnections - 1);
+        }
       }
       
       // Create or update room
@@ -212,49 +286,56 @@ io.on('connection', (socket) => {
           createdAt: new Date()
         });
         stats.activeRooms = rooms.size;
+        logConnection(`Created new room: ${roomId}`);
       }
       
       const room = rooms.get(roomId);
-      
-      // Disconnect previous TV if exists
-      if (room.tv && room.tv.id !== socket.id) {
-        room.tv.emit('replaced', { message: 'New TV connected' });
-        room.tv.leave(roomId);
-        room.tv.disconnect();
-        stats.tvConnections--;
-      }
       
       // Set this socket as the TV for the room
       room.tv = socket;
       socket.roomId = roomId;
       socket.deviceType = 'tv';
+      socket.deviceName = data?.deviceName || 'TV Display';
       socket.join(roomId);
       stats.tvConnections++;
       
-      logConnection(`TV registered in room ${roomId}: ${socket.id}`);
+      logConnection(`TV registered successfully in room ${roomId}: ${socket.id}`);
       
       // Send registration confirmation with room ID
       socket.emit('registered', { 
         deviceType: 'tv',
         roomId: roomId,
         clientId: socket.id,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        message: 'TV registered successfully'
       });
       
       // Notify mobile if already connected
-      if (room.mobile) {
+      if (room.mobile && room.mobile.connected) {
         room.mobile.emit('tv_connected', { 
           status: 'tv_connected',
-          clientId: socket.id,
+          deviceId: socket.id,
+          deviceName: socket.deviceName,
           timestamp: new Date().toISOString()
         });
+        
+        // Also notify TV about existing mobile
+        socket.emit('mobile_connected', {
+          status: 'mobile_connected',
+          deviceId: room.mobile.id,
+          deviceName: room.mobile.deviceName || 'Mobile Controller',
+          timestamp: new Date().toISOString()
+        });
+        
+        logConnection(`Notified devices about existing connections in room ${roomId}`);
       }
       
     } catch (error) {
       logConnection(`TV registration error: ${error.message}`);
       socket.emit('error', { 
-        message: 'Registration failed',
-        code: 'REGISTRATION_ERROR'
+        message: 'TV registration failed',
+        code: 'TV_REGISTRATION_ERROR',
+        details: error.message
       });
     }
   });
@@ -262,66 +343,98 @@ io.on('connection', (socket) => {
   // Handle mobile registration (joins existing room)
   socket.on('register_mobile', (data) => {
     try {
-      const { roomId } = data;
+      logConnection(`Mobile registration request: ${JSON.stringify(data)} from ${socket.id}`);
+      
+      const roomId = data?.roomId ? data.roomId.toString() : null;
       
       if (!roomId) {
         socket.emit('error', { 
-          message: 'Room ID is required',
+          message: 'Room ID is required for mobile registration',
           code: 'ROOM_ID_REQUIRED'
         });
         return;
       }
       
-      if (!rooms.has(roomId)) {
+      if (!validateRoomId(roomId)) {
         socket.emit('error', { 
-          message: 'Room not found',
-          code: 'ROOM_NOT_FOUND'
+          message: 'Invalid room ID format',
+          code: 'INVALID_ROOM_ID'
+        });
+        return;
+      }
+      
+      if (!rooms.has(roomId)) {
+        logConnection(`Room ${roomId} not found for mobile registration`);
+        socket.emit('error', { 
+          message: 'Room not found. Make sure the TV is connected and displaying the correct room code.',
+          code: 'ROOM_NOT_FOUND',
+          roomId: roomId
         });
         return;
       }
       
       const room = rooms.get(roomId);
       
+      // Check if TV is connected
+      if (!room.tv || !room.tv.connected) {
+        logConnection(`No TV connected in room ${roomId} for mobile registration`);
+        socket.emit('error', { 
+          message: 'No TV connected in this room. Please make sure the TV is online.',
+          code: 'NO_TV_IN_ROOM',
+          roomId: roomId
+        });
+        return;
+      }
+      
       // Disconnect previous mobile if exists
-      if (room.mobile && room.mobile.id !== socket.id) {
-        room.mobile.emit('replaced', { message: 'New mobile connected' });
+      if (room.mobile && room.mobile.connected && room.mobile.id !== socket.id) {
+        logConnection(`Replacing existing mobile in room ${roomId}`);
+        room.mobile.emit('replaced', { 
+          message: 'New mobile device connected to this room',
+          timestamp: new Date().toISOString()
+        });
         room.mobile.leave(roomId);
-        room.mobile.disconnect();
-        stats.mobileConnections--;
+        room.mobile.disconnect(true);
+        stats.mobileConnections = Math.max(0, stats.mobileConnections - 1);
       }
       
       // Set this socket as the mobile for the room
       room.mobile = socket;
       socket.roomId = roomId;
       socket.deviceType = 'mobile';
+      socket.deviceName = data?.deviceName || 'Mobile Controller';
       socket.join(roomId);
       stats.mobileConnections++;
       
-      logConnection(`Mobile registered in room ${roomId}: ${socket.id}`);
+      logConnection(`Mobile registered successfully in room ${roomId}: ${socket.id}`);
       
       // Send registration confirmation
       socket.emit('registered', { 
         deviceType: 'mobile',
         roomId: roomId,
         clientId: socket.id,
-        connectedTV: !!room.tv,
-        timestamp: new Date().toISOString()
+        connectedTV: true,
+        tvId: room.tv.id,
+        timestamp: new Date().toISOString(),
+        message: 'Mobile registered successfully'
       });
       
       // Notify TV about mobile connection
-      if (room.tv) {
-        room.tv.emit('mobile_connected', { 
-          status: 'mobile_connected',
-          clientId: socket.id,
-          timestamp: new Date().toISOString()
-        });
-      }
+      room.tv.emit('mobile_connected', { 
+        status: 'mobile_connected',
+        deviceId: socket.id,
+        deviceName: socket.deviceName,
+        timestamp: new Date().toISOString()
+      });
+      
+      logConnection(`Room ${roomId} now has both TV and mobile connected`);
       
     } catch (error) {
       logConnection(`Mobile registration error: ${error.message}`);
       socket.emit('error', { 
-        message: 'Registration failed',
-        code: 'REGISTRATION_ERROR'
+        message: 'Mobile registration failed',
+        code: 'MOBILE_REGISTRATION_ERROR',
+        details: error.message
       });
     }
   });
@@ -329,35 +442,52 @@ io.on('connection', (socket) => {
   // Handle slide changes from mobile
   socket.on('slide_change', (data) => {
     try {
-      if (socket.deviceType === 'mobile' && socket.roomId) {
-        const room = rooms.get(socket.roomId);
-        if (room && room.tv) {
-          if (typeof data.slideIndex !== 'number') {
-            throw new Error('Invalid slide index');
-          }
-          logConnection(`Room ${socket.roomId} - Slide change: ${data.slideIndex}`);
-          room.tv.emit('slide_change', {
-            ...data,
-            timestamp: new Date().toISOString(),
-            from: socket.id
-          });
-        } else {
-          socket.emit('error', { 
-            message: 'TV not connected in this room',
-            code: 'NO_TV_IN_ROOM'
-          });
-        }
-      } else {
+      if (socket.deviceType !== 'mobile' || !socket.roomId) {
         socket.emit('error', { 
-          message: 'Unauthorized',
-          code: 'UNAUTHORIZED'
+          message: 'Unauthorized: Only mobile devices in a room can change slides',
+          code: 'UNAUTHORIZED_SLIDE_CHANGE'
         });
+        return;
       }
+      
+      const room = rooms.get(socket.roomId);
+      if (!room?.tv?.connected) {
+        socket.emit('error', { 
+          message: 'TV not connected in this room',
+          code: 'NO_TV_IN_ROOM'
+        });
+        return;
+      }
+      
+      if (typeof data.slideIndex !== 'number' || data.slideIndex < 0) {
+        socket.emit('error', { 
+          message: 'Invalid slide index',
+          code: 'INVALID_SLIDE_INDEX'
+        });
+        return;
+      }
+      
+      logConnection(`Room ${socket.roomId} - Slide change: ${data.slideIndex} from mobile ${socket.id}`);
+      
+      room.tv.emit('slide_change', {
+        slideIndex: data.slideIndex,
+        roomId: socket.roomId,
+        timestamp: new Date().toISOString(),
+        from: socket.id
+      });
+      
+      // Acknowledge to mobile
+      socket.emit('slide_change_ack', {
+        slideIndex: data.slideIndex,
+        timestamp: new Date().toISOString()
+      });
+      
     } catch (error) {
       logConnection(`Slide change error: ${error.message}`);
       socket.emit('error', { 
-        message: 'Invalid slide change data',
-        code: 'INVALID_SLIDE_DATA'
+        message: 'Failed to change slide',
+        code: 'SLIDE_CHANGE_ERROR',
+        details: error.message
       });
     }
   });
@@ -365,35 +495,47 @@ io.on('connection', (socket) => {
   // Handle PDF scroll from mobile
   socket.on('pdf_scroll', (data) => {
     try {
-      if (socket.deviceType === 'mobile' && socket.roomId) {
-        const room = rooms.get(socket.roomId);
-        if (room && room.tv) {
-          if (typeof data.scrollOffset !== 'number') {
-            throw new Error('Invalid scroll offset');
-          }
-          logConnection(`Room ${socket.roomId} - PDF scroll: offset ${data.scrollOffset}, page ${data.pageNumber || 'unknown'}`);
-          room.tv.emit('pdf_scroll', {
-            ...data,
-            timestamp: new Date().toISOString(),
-            from: socket.id
-          });
-        } else {
-          socket.emit('error', { 
-            message: 'TV not connected in this room',
-            code: 'NO_TV_IN_ROOM'
-          });
-        }
-      } else {
+      if (socket.deviceType !== 'mobile' || !socket.roomId) {
         socket.emit('error', { 
-          message: 'Unauthorized',
-          code: 'UNAUTHORIZED'
+          message: 'Unauthorized: Only mobile devices in a room can scroll PDF',
+          code: 'UNAUTHORIZED_PDF_SCROLL'
         });
+        return;
       }
+      
+      const room = rooms.get(socket.roomId);
+      if (!room?.tv?.connected) {
+        socket.emit('error', { 
+          message: 'TV not connected in this room',
+          code: 'NO_TV_IN_ROOM'
+        });
+        return;
+      }
+      
+      if (typeof data.scrollOffset !== 'number') {
+        socket.emit('error', { 
+          message: 'Invalid scroll offset',
+          code: 'INVALID_SCROLL_OFFSET'
+        });
+        return;
+      }
+      
+      logConnection(`Room ${socket.roomId} - PDF scroll: offset ${data.scrollOffset}, page ${data.pageNumber || 'unknown'}`);
+      
+      room.tv.emit('pdf_scroll', {
+        scrollOffset: data.scrollOffset,
+        pageNumber: data.pageNumber || 1,
+        roomId: socket.roomId,
+        timestamp: new Date().toISOString(),
+        from: socket.id
+      });
+      
     } catch (error) {
       logConnection(`PDF scroll error: ${error.message}`);
       socket.emit('error', { 
-        message: 'Invalid PDF scroll data',
-        code: 'INVALID_SCROLL_DATA'
+        message: 'Failed to scroll PDF',
+        code: 'PDF_SCROLL_ERROR',
+        details: error.message
       });
     }
   });
@@ -401,35 +543,46 @@ io.on('connection', (socket) => {
   // Handle PDF page change from mobile
   socket.on('pdf_page_change', (data) => {
     try {
-      if (socket.deviceType === 'mobile' && socket.roomId) {
-        const room = rooms.get(socket.roomId);
-        if (room && room.tv) {
-          if (typeof data.pageNumber !== 'number') {
-            throw new Error('Invalid page number');
-          }
-          logConnection(`Room ${socket.roomId} - PDF page change: ${data.pageNumber}`);
-          room.tv.emit('pdf_page_change', {
-            ...data,
-            timestamp: new Date().toISOString(),
-            from: socket.id
-          });
-        } else {
-          socket.emit('error', { 
-            message: 'TV not connected in this room',
-            code: 'NO_TV_IN_ROOM'
-          });
-        }
-      } else {
+      if (socket.deviceType !== 'mobile' || !socket.roomId) {
         socket.emit('error', { 
-          message: 'Unauthorized',
-          code: 'UNAUTHORIZED'
+          message: 'Unauthorized: Only mobile devices in a room can change PDF pages',
+          code: 'UNAUTHORIZED_PDF_PAGE_CHANGE'
         });
+        return;
       }
+      
+      const room = rooms.get(socket.roomId);
+      if (!room?.tv?.connected) {
+        socket.emit('error', { 
+          message: 'TV not connected in this room',
+          code: 'NO_TV_IN_ROOM'
+        });
+        return;
+      }
+      
+      if (typeof data.pageNumber !== 'number' || data.pageNumber < 1) {
+        socket.emit('error', { 
+          message: 'Invalid page number',
+          code: 'INVALID_PAGE_NUMBER'
+        });
+        return;
+      }
+      
+      logConnection(`Room ${socket.roomId} - PDF page change: ${data.pageNumber}`);
+      
+      room.tv.emit('pdf_page_change', {
+        pageNumber: data.pageNumber,
+        roomId: socket.roomId,
+        timestamp: new Date().toISOString(),
+        from: socket.id
+      });
+      
     } catch (error) {
       logConnection(`PDF page change error: ${error.message}`);
       socket.emit('error', { 
-        message: 'Invalid PDF page data',
-        code: 'INVALID_PAGE_DATA'
+        message: 'Failed to change PDF page',
+        code: 'PDF_PAGE_CHANGE_ERROR',
+        details: error.message
       });
     }
   });
@@ -437,36 +590,47 @@ io.on('connection', (socket) => {
   // Handle presentation actions from mobile
   socket.on('presentation_action', (data) => {
     try {
-      if (socket.deviceType === 'mobile' && socket.roomId) {
-        const room = rooms.get(socket.roomId);
-        if (room && room.tv) {
-          const validActions = ['play', 'pause', 'stop', 'next', 'previous', 'fullscreen', 'exit_fullscreen'];
-          if (!validActions.includes(data.action)) {
-            throw new Error('Invalid action');
-          }
-          logConnection(`Room ${socket.roomId} - Presentation action: ${data.action}`);
-          room.tv.emit('presentation_action', {
-            ...data,
-            timestamp: new Date().toISOString(),
-            from: socket.id
-          });
-        } else {
-          socket.emit('error', { 
-            message: 'TV not connected in this room',
-            code: 'NO_TV_IN_ROOM'
-          });
-        }
-      } else {
+      if (socket.deviceType !== 'mobile' || !socket.roomId) {
         socket.emit('error', { 
-          message: 'Unauthorized',
-          code: 'UNAUTHORIZED'
+          message: 'Unauthorized: Only mobile devices in a room can send presentation actions',
+          code: 'UNAUTHORIZED_PRESENTATION_ACTION'
         });
+        return;
       }
+      
+      const room = rooms.get(socket.roomId);
+      if (!room?.tv?.connected) {
+        socket.emit('error', { 
+          message: 'TV not connected in this room',
+          code: 'NO_TV_IN_ROOM'
+        });
+        return;
+      }
+      
+      if (!data.action) {
+        socket.emit('error', { 
+          message: 'Action is required',
+          code: 'MISSING_ACTION'
+        });
+        return;
+      }
+      
+      logConnection(`Room ${socket.roomId} - Presentation action: ${data.action} with params: ${JSON.stringify(data.params || {})}`);
+      
+      room.tv.emit('presentation_action', {
+        action: data.action,
+        params: data.params || {},
+        roomId: socket.roomId,
+        timestamp: new Date().toISOString(),
+        from: socket.id
+      });
+      
     } catch (error) {
       logConnection(`Presentation action error: ${error.message}`);
       socket.emit('error', { 
-        message: 'Invalid presentation action',
-        code: 'INVALID_ACTION'
+        message: 'Failed to execute presentation action',
+        code: 'PRESENTATION_ACTION_ERROR',
+        details: error.message
       });
     }
   });
@@ -474,36 +638,48 @@ io.on('connection', (socket) => {
   // Handle document/media loading
   socket.on('load_document', (data) => {
     try {
-      if (socket.deviceType === 'mobile' && socket.roomId) {
-        const room = rooms.get(socket.roomId);
-        if (room && room.tv) {
-          const validTypes = ['pdf', 'powerpoint', 'image', 'video'];
-          if (!validTypes.includes(data.documentType)) {
-            throw new Error('Invalid document type');
-          }
-          logConnection(`Room ${socket.roomId} - Load document: ${data.documentType} - ${data.documentUrl || data.documentName || 'unknown'}`);
-          room.tv.emit('load_document', {
-            ...data,
-            timestamp: new Date().toISOString(),
-            from: socket.id
-          });
-        } else {
-          socket.emit('error', { 
-            message: 'TV not connected in this room',
-            code: 'NO_TV_IN_ROOM'
-          });
-        }
-      } else {
+      if (socket.deviceType !== 'mobile' || !socket.roomId) {
         socket.emit('error', { 
-          message: 'Unauthorized',
-          code: 'UNAUTHORIZED'
+          message: 'Unauthorized: Only mobile devices in a room can load documents',
+          code: 'UNAUTHORIZED_LOAD_DOCUMENT'
         });
+        return;
       }
+      
+      const room = rooms.get(socket.roomId);
+      if (!room?.tv?.connected) {
+        socket.emit('error', { 
+          message: 'TV not connected in this room',
+          code: 'NO_TV_IN_ROOM'
+        });
+        return;
+      }
+      
+      if (!data.documentType || !data.documentUrl) {
+        socket.emit('error', { 
+          message: 'Document type and URL are required',
+          code: 'MISSING_DOCUMENT_INFO'
+        });
+        return;
+      }
+      
+      logConnection(`Room ${socket.roomId} - Load document: ${data.documentType} - ${data.documentUrl}`);
+      
+      room.tv.emit('load_document', {
+        documentType: data.documentType,
+        documentUrl: data.documentUrl,
+        metadata: data.metadata || {},
+        roomId: socket.roomId,
+        timestamp: new Date().toISOString(),
+        from: socket.id
+      });
+      
     } catch (error) {
       logConnection(`Load document error: ${error.message}`);
       socket.emit('error', { 
-        message: 'Invalid document data',
-        code: 'INVALID_DOCUMENT_DATA'
+        message: 'Failed to load document',
+        code: 'LOAD_DOCUMENT_ERROR',
+        details: error.message
       });
     }
   });
@@ -511,182 +687,322 @@ io.on('connection', (socket) => {
   // Handle custom events
   socket.on('custom_event', (data) => {
     try {
-      if (socket.roomId) {
-        const room = rooms.get(socket.roomId);
-        if (room) {
-          logConnection(`Room ${socket.roomId} - Custom event: ${data.eventType || 'unknown'}`);
-          
-          // Forward to the other device in the room
-          if (socket.deviceType === 'mobile' && room.tv) {
-            room.tv.emit('custom_event', {
-              ...data,
-              timestamp: new Date().toISOString(),
-              from: socket.id
-            });
-          } else if (socket.deviceType === 'tv' && room.mobile) {
-            room.mobile.emit('custom_event', {
-              ...data,
-              timestamp: new Date().toISOString(),
-              from: socket.id
-            });
-          } else {
-            socket.emit('error', { 
-              message: 'Other device not connected in this room',
-              code: 'DEVICE_NOT_CONNECTED'
-            });
-          }
-        } else {
-          socket.emit('error', { 
-            message: 'Room not found',
-            code: 'ROOM_NOT_FOUND'
-          });
-        }
-      } else {
+      if (!socket.roomId) {
         socket.emit('error', { 
           message: 'Not in a room',
           code: 'NO_ROOM'
         });
+        return;
       }
+      
+      const room = rooms.get(socket.roomId);
+      if (!room) {
+        socket.emit('error', { 
+          message: 'Room not found',
+          code: 'ROOM_NOT_FOUND'
+        });
+        return;
+      }
+      
+      logConnection(`Room ${socket.roomId} - Custom event: ${data.eventType || 'unknown'} from ${socket.deviceType}`);
+      
+      // Forward to the other device in the room
+      const targetDevice = socket.deviceType === 'mobile' ? room.tv : room.mobile;
+      if (targetDevice && targetDevice.connected) {
+        targetDevice.emit('custom_event', {
+          ...data,
+          roomId: socket.roomId,
+          timestamp: new Date().toISOString(),
+          from: socket.id,
+          fromDevice: socket.deviceType
+        });
+      } else {
+        socket.emit('error', { 
+          message: `${socket.deviceType === 'mobile' ? 'TV' : 'Mobile'} not connected in this room`,
+          code: 'TARGET_DEVICE_NOT_CONNECTED'
+        });
+      }
+      
     } catch (error) {
       logConnection(`Custom event error: ${error.message}`);
       socket.emit('error', { 
-        message: 'Invalid custom event data',
-        code: 'INVALID_CUSTOM_EVENT'
+        message: 'Failed to send custom event',
+        code: 'CUSTOM_EVENT_ERROR',
+        details: error.message
       });
     }
   });
 
+  // Handle ping for connection health monitoring
+  socket.on('ping', (data) => {
+    socket.isHealthy = true;
+    socket.lastPing = new Date();
+    socket.emit('pong', { 
+      timestamp: new Date().toISOString(),
+      clientId: socket.id
+    });
+  });
+
+  // Handle pong responses
+  socket.on('pong', (data) => {
+    socket.isHealthy = true;
+    socket.lastPong = new Date();
+  });
+
+  // Handle connection test
+  socket.on('connection_test', (data) => {
+    socket.emit('connection_test_response', {
+      received: data,
+      timestamp: new Date().toISOString(),
+      serverId: socket.id,
+      status: 'connected'
+    });
+  });
+
   // Handle disconnection
   socket.on('disconnect', (reason) => {
-    stats.currentConnections--;
-    logConnection(`Client disconnected: ${socket.id} - Reason: ${reason}`);
+    stats.currentConnections = Math.max(0, stats.currentConnections - 1);
     
-    if (socket.roomId) {
+    logConnection(`Client disconnected: ${socket.id} - Device: ${socket.deviceType || 'unknown'} - Room: ${socket.roomId || 'none'} - Reason: ${reason}`);
+    
+    if (socket.roomId && rooms.has(socket.roomId)) {
       const room = rooms.get(socket.roomId);
-      if (room) {
-        if (socket.deviceType === 'tv') {
-          room.tv = null;
-          stats.tvConnections--;
-          // Notify mobile about TV disconnection
-          if (room.mobile) {
-            room.mobile.emit('tv_disconnected', { 
-              status: 'disconnected',
-              reason: reason,
-              timestamp: new Date().toISOString()
-            });
-          }
-        } else if (socket.deviceType === 'mobile') {
-          room.mobile = null;
-          stats.mobileConnections--;
-          // Notify TV about mobile disconnection
-          if (room.tv) {
-            room.tv.emit('mobile_disconnected', { 
-              status: 'disconnected',
-              reason: reason,
-              timestamp: new Date().toISOString()
-            });
-          }
+      
+      if (socket.deviceType === 'tv' && room.tv?.id === socket.id) {
+        room.tv = null;
+        stats.tvConnections = Math.max(0, stats.tvConnections - 1);
+        
+        // Notify mobile about TV disconnection
+        if (room.mobile && room.mobile.connected) {
+          room.mobile.emit('tv_disconnected', { 
+            status: 'disconnected',
+            deviceId: socket.id,
+            reason: reason,
+            timestamp: new Date().toISOString()
+          });
         }
         
-        // Clean up empty rooms
-        if (!room.tv && !room.mobile) {
-          cleanupRoom(socket.roomId);
+        logConnection(`TV disconnected from room ${socket.roomId}`);
+        
+      } else if (socket.deviceType === 'mobile' && room.mobile?.id === socket.id) {
+        room.mobile = null;
+        stats.mobileConnections = Math.max(0, stats.mobileConnections - 1);
+        
+        // Notify TV about mobile disconnection
+        if (room.tv && room.tv.connected) {
+          room.tv.emit('mobile_disconnected', { 
+            status: 'disconnected',
+            deviceId: socket.id,
+            reason: reason,
+            timestamp: new Date().toISOString()
+          });
         }
+        
+        logConnection(`Mobile disconnected from room ${socket.roomId}`);
+      }
+      
+      // Clean up empty rooms
+      if ((!room.tv || !room.tv.connected) && (!room.mobile || !room.mobile.connected)) {
+        cleanupRoom(socket.roomId, 'all_devices_disconnected');
       }
     }
   });
 
-  // Handle errors
+  // Handle socket errors
   socket.on('error', (error) => {
     logConnection(`Socket error for ${socket.id}: ${error.message || error}`);
+    socket.emit('error_ack', {
+      message: 'Socket error received',
+      timestamp: new Date().toISOString()
+    });
   });
 
-  // Ping-pong for connection health
-  socket.on('ping', () => {
-    socket.emit('pong', { timestamp: new Date().toISOString() });
-  });
-
-  // Handle pong responses
-  socket.on('pong', () => {
-    socket.lastPong = new Date();
+  // Send welcome message
+  socket.emit('connected', {
+    message: 'Connected to Flutter Presentation Server',
+    clientId: socket.id,
+    serverVersion: '2.2.0',
+    timestamp: new Date().toISOString()
   });
 });
 
-// Health check interval - ping clients every 30 seconds
+// Health monitoring - ping clients every 30 seconds
 setInterval(() => {
   const now = new Date();
+  let healthyConnections = 0;
   
   for (const [roomId, room] of rooms.entries()) {
-    if (room.mobile) {
-      room.mobile.emit('ping', { timestamp: now.toISOString() });
+    if (room.mobile && room.mobile.connected) {
+      room.mobile.emit('ping', { 
+        timestamp: now.toISOString(),
+        type: 'health_check'
+      });
+      if (room.mobile.isHealthy) healthyConnections++;
     }
-    if (room.tv) {
-      room.tv.emit('ping', { timestamp: now.toISOString() });
+    if (room.tv && room.tv.connected) {
+      room.tv.emit('ping', { 
+        timestamp: now.toISOString(),
+        type: 'health_check'
+      });
+      if (room.tv.isHealthy) healthyConnections++;
     }
   }
+  
+  logConnection(`Health check sent to ${healthyConnections} healthy connections`);
 }, 30000);
 
-// Cleanup disconnected clients every 60 seconds
+// Cleanup unhealthy connections every 2 minutes
 setInterval(() => {
   const now = new Date();
-  const timeout = 60000; // 60 seconds timeout
+  const timeout = 120000; // 2 minutes timeout
   
   for (const [roomId, room] of rooms.entries()) {
-    let shouldCleanup = false;
+    let roomNeedsCleanup = false;
     
-    if (room.mobile && room.mobile.lastPong && (now - room.mobile.lastPong) > timeout) {
-      logConnection(`Mobile client ${room.mobile.id} in room ${roomId} timed out`);
-      room.mobile.disconnect();
-      room.mobile = null;
-      shouldCleanup = !room.tv;
+    // Check mobile health
+    if (room.mobile) {
+      const isUnhealthy = !room.mobile.connected || 
+                         (room.mobile.lastPong && (now - room.mobile.lastPong) > timeout);
+      
+      if (isUnhealthy) {
+        logConnection(`Mobile client ${room.mobile.id} in room ${roomId} is unhealthy, removing...`);
+        if (room.mobile.connected) {
+          room.mobile.emit('connection_timeout', { message: 'Connection timed out' });
+          room.mobile.disconnect(true);
+        }
+        room.mobile = null;
+        stats.mobileConnections = Math.max(0, stats.mobileConnections - 1);
+        roomNeedsCleanup = !room.tv || !room.tv.connected;
+      }
     }
     
-    if (room.tv && room.tv.lastPong && (now - room.tv.lastPong) > timeout) {
-      logConnection(`TV client ${room.tv.id} in room ${roomId} timed out`);
-      room.tv.disconnect();
-      room.tv = null;
-      shouldCleanup = shouldCleanup || !room.mobile;
+    // Check TV health
+    if (room.tv) {
+      const isUnhealthy = !room.tv.connected || 
+                         (room.tv.lastPong && (now - room.tv.lastPong) > timeout);
+      
+      if (isUnhealthy) {
+        logConnection(`TV client ${room.tv.id} in room ${roomId} is unhealthy, removing...`);
+        if (room.tv.connected) {
+          room.tv.emit('connection_timeout', { message: 'Connection timed out' });
+          room.tv.disconnect(true);
+        }
+        room.tv = null;
+        stats.tvConnections = Math.max(0, stats.tvConnections - 1);
+        roomNeedsCleanup = roomNeedsCleanup || !room.mobile || !room.mobile.connected;
+      }
     }
     
-    if (shouldCleanup) {
-      cleanupRoom(roomId);
+    // Clean up empty or unhealthy rooms
+    if (roomNeedsCleanup) {
+      cleanupRoom(roomId, 'unhealthy_connections');
     }
   }
-}, 60000);
+}, 120000);
 
-// Periodic room cleanup - remove old empty rooms
+// Periodic room cleanup - remove old empty rooms every 5 minutes
 setInterval(() => {
   const now = Date.now();
+  const roomsToCleanup = [];
+  
   for (const [roomId, room] of rooms.entries()) {
-    if (now - room.createdAt.getTime() > ROOM_TIMEOUT) {
-      logConnection(`Room ${roomId} expired`);
-      cleanupRoom(roomId);
+    const roomAge = now - room.createdAt.getTime();
+    const isEmpty = (!room.tv || !room.tv.connected) && (!room.mobile || !room.mobile.connected);
+    const isExpired = roomAge > ROOM_TIMEOUT;
+    
+    if (isEmpty && isExpired) {
+      roomsToCleanup.push(roomId);
     }
   }
-}, 60000); // Check every minute
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  logConnection('SIGTERM received, shutting down gracefully');
-  server.close(() => {
-    logConnection('Server closed');
-    process.exit(0);
+  
+  roomsToCleanup.forEach(roomId => {
+    cleanupRoom(roomId, 'expired');
   });
+  
+  if (roomsToCleanup.length > 0) {
+    logConnection(`Cleaned up ${roomsToCleanup.length} expired rooms`);
+  }
+}, 300000); // Every 5 minutes
+
+// Log server statistics every 10 minutes
+setInterval(() => {
+  const status = getConnectionStatus();
+  logConnection(`Server Statistics - Connections: ${stats.currentConnections}, Active Rooms: ${status.totalRooms}, TVs: ${status.connectedTVs}, Mobiles: ${status.connectedMobiles}`);
+}, 600000);
+
+// Graceful shutdown handling
+const gracefulShutdown = (signal) => {
+  logConnection(`${signal} received, initiating graceful shutdown...`);
+  
+  // Notify all connected clients about server shutdown
+  for (const [roomId, room] of rooms.entries()) {
+    if (room.tv && room.tv.connected) {
+      room.tv.emit('server_shutdown', { 
+        message: 'Server is shutting down for maintenance',
+        timestamp: new Date().toISOString()
+      });
+    }
+    if (room.mobile && room.mobile.connected) {
+      room.mobile.emit('server_shutdown', { 
+        message: 'Server is shutting down for maintenance',
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+  
+  // Close server gracefully
+  io.close(() => {
+    logConnection('Socket.IO server closed');
+    server.close(() => {
+      logConnection('HTTP server closed');
+      process.exit(0);
+    });
+  });
+  
+  // Force close after 10 seconds if graceful shutdown fails
+  setTimeout(() => {
+    logConnection('Force closing server after timeout');
+    process.exit(1);
+  }, 10000);
+};
+
+// Handle shutdown signals
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  logConnection(`Uncaught Exception: ${error.message}`);
+  console.error(error.stack);
+  gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 
-process.on('SIGINT', () => {
-  logConnection('SIGINT received, shutting down gracefully');
-  server.close(() => {
-    logConnection('Server closed');
-    process.exit(0);
-  });
+process.on('unhandledRejection', (reason, promise) => {
+  logConnection(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+  console.error(reason);
 });
 
+// Start server
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  logConnection(`Multi-Room Socket.IO Presentation Server running on port ${PORT}`);
-  logConnection(`Health check available at http://localhost:${PORT}/health`);
-  logConnection(`API status available at http://localhost:${PORT}/api/status`);
+const HOST = process.env.HOST || '0.0.0.0';
+
+server.listen(PORT, HOST, () => {
+  logConnection(`Flutter Socket.IO Presentation Server v2.2.0 running on ${HOST}:${PORT}`);
+  logConnection(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  logConnection(`Health check: http://${HOST}:${PORT}/health`);
+  logConnection(`API status: http://${HOST}:${PORT}/api/status`);
+  logConnection(`CORS enabled for: ${process.env.CORS_ORIGIN || '*'}`);
+  logConnection(`Room timeout: ${ROOM_TIMEOUT / 1000 / 60} minutes`);
 });
 
-module.exports = { app, server, io };
+// Export for testing
+module.exports = { 
+  app, 
+  server, 
+  io, 
+  rooms, 
+  stats, 
+  getRoomInfo, 
+  getConnectionStatus,
+  cleanupRoom
+};
